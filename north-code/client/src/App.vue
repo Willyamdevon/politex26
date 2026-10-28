@@ -1,0 +1,1250 @@
+<script>
+import axios from './api';
+
+export default {
+    data() {
+        return {
+            isDemo: import.meta.env.VITE_DEMO === 'true',
+            tab: 'station',
+            method: 'exact',
+            budget: import.meta.env.VITE_DEMO === 'true' ? 1900000 : 2600000,
+            deadline: 14,
+            disabledSuppliers: [],
+
+            data: null,
+            results: {},
+            busy: false,
+            loading: true,
+            error: '',
+            notice: '',
+            videoReady: false,
+            motionAllowed: !window.matchMedia('(prefers-reduced-motion: reduce)').matches,
+
+            history: [],
+            planName: '',
+            selectedObject: '',
+
+            searchType: 'Генератор',
+            searchCapacity: 8,
+            searchTemperature: -30,
+            models: [],
+            searched: false,
+            selectedModel: '',
+
+            importFiles: { equipment: null, offers: null, suppliers: null, station: null },
+            importName: '',
+            nav: [
+                { id: 'import', name: 'Импорт CSV', icon: '⇧' },
+                { id: 'station', name: 'Станция', icon: '⌘' },
+                { id: 'purchases', name: 'План закупок', icon: '▤' },
+                { id: 'catalog', name: 'Каталог', icon: '▦' },
+                { id: 'comparison', name: 'Сравнение', icon: '◈' },
+                { id: 'history', name: 'История', icon: '◷' },
+            ],
+        };
+    },
+    computed: {
+        result() {
+            return this.results[this.method] || null;
+        },
+
+        ready() {
+            return this.result?.status === 'ok';
+        },
+
+        types() {
+            return [...new Set((this.data?.equipment || []).map((item) => item.equipment_type))];
+        },
+
+        objectDetails() {
+            return (this.result?.diagnosis || []).filter((item) => item.object_id === this.selectedObject);
+        },
+
+        selectedOffers() {
+            return (this.data?.offers || []).filter((item) => item.equipment_id === this.selectedModel);
+        },
+
+        groups() {
+            if (!this.ready) return [];
+            return [...new Set(this.result.plan.map((item) => item.supplier_id))].map((id) => ({
+                ...this.data.suppliers.find((item) => item.supplier_id === id),
+                items: this.result.plan.filter((item) => item.supplier_id === id),
+            }));
+        },
+    },
+    methods: {
+        money(value) {
+            return Number(value || 0).toLocaleString('ru-RU') + ' ₽';
+        },
+
+        methodName(method) {
+            return method === 'exact' ? 'Основной Go' : 'OR-Tools CP-SAT';
+        },
+
+        params(method = this.method) {
+            return {
+                method,
+                dataset_id: this.data?.dataset.id,
+                budget: Number(this.budget),
+                deadline: Number(this.deadline),
+                disabled_suppliers: this.disabledSuppliers,
+            };
+        },
+
+        clearResults() {
+            this.results = {};
+            this.selectedObject = '';
+            this.notice = '';
+        },
+
+        showError(error) {
+            this.error =
+                error.response?.data?.message || 'Не удалось выполнить запрос. Проверьте подключение к серверу.';
+        },
+
+        async calculate(compare = false) {
+            if (this.busy) return;
+
+            this.busy = true;
+            this.error = '';
+            this.notice = '';
+
+            try {
+                let methods = compare ? ['exact', 'ortools'] : [this.method];
+                for (let method of methods) {
+                    let res = await axios.post('/api/calculate', this.params(method));
+                    this.results[method] = res.data;
+                    if (res.data.demo_notice) this.notice = res.data.demo_notice;
+                }
+            } catch (error) {
+                this.showError(error);
+            } finally {
+                this.busy = false;
+            }
+        },
+
+        async search() {
+            this.error = '';
+
+            try {
+                let res = await axios.post('/api/search', {
+                    dataset_id: this.data.dataset.id,
+                    equipment_type: this.searchType,
+                    capacity: Number(this.searchCapacity),
+                    temperature: Number(this.searchTemperature),
+                });
+                this.models = res.data.equipment;
+                this.searched = true;
+                this.selectedModel = '';
+            } catch (error) {
+                this.showError(error);
+            }
+        },
+
+        offerInfo(offer) {
+            let supplier = this.data.suppliers.find((item) => item.supplier_id === offer.supplier_id);
+            let model = this.data.equipment.find((item) => item.equipment_id === offer.equipment_id);
+            let ready = Number(supplier.delivery_days) + Number(model.installation_days);
+            let reasons = [];
+            if (Number(offer.stock_quantity) === 0) reasons.push('Нет в наличии');
+            if (ready > this.deadline) reasons.push('Не успевает к сроку');
+            if (this.disabledSuppliers.includes(offer.supplier_id)) reasons.push('Отключён в сценарии');
+            return {
+                supplier: supplier.supplier_name,
+                ready,
+                reason: reasons.join(' · ') || 'Подходит для одной единицы',
+            };
+        },
+
+        async loadHistory() {
+            try {
+                let res = await axios.get('/api/plans');
+                this.history = res.data.plans;
+            } catch (error) {
+                this.showError(error);
+            }
+        },
+
+        async savePlan() {
+            if (!this.result || this.busy) return;
+
+            this.busy = true;
+            this.error = '';
+
+            try {
+                await axios.post('/api/plans', {
+                    ...this.params(),
+                    name: this.planName.trim() || 'Сценарий · ' + this.methodName(this.method),
+                });
+                this.notice = 'План сохранён в историю';
+                await this.loadHistory();
+            } catch (error) {
+                this.showError(error);
+            } finally {
+                this.busy = false;
+            }
+        },
+
+        async renamePlan(item) {
+            this.error = '';
+
+            try {
+                await axios.patch('/api/plans/' + item.id, { name: item.name });
+            } catch (error) {
+                this.showError(error);
+                await this.loadHistory();
+            }
+        },
+
+        async deletePlan(item) {
+            this.error = '';
+
+            try {
+                await axios.delete('/api/plans/' + item.id);
+                await this.loadHistory();
+            } catch (error) {
+                this.showError(error);
+            }
+        },
+
+        async openPlan(item) {
+            if (this.busy) return;
+            this.busy = true;
+            this.error = '';
+            try {
+                await this.loadData(item.dataset_id || item.result.dataset_id);
+                this.budget = item.result.budget;
+                this.deadline = item.result.deadline;
+                this.disabledSuppliers = item.result.disabled_suppliers || [];
+                this.method = item.result.method;
+                this.results = { [this.method]: item.result };
+                this.selectedObject = '';
+                this.tab = 'station';
+                this.notice = 'Открыт сохранённый расчёт от ' + item.created_at + ' UTC';
+            } catch (error) {
+                this.showError(error);
+            } finally {
+                this.busy = false;
+            }
+        },
+
+        downloadReport() {
+            let file = new Blob([JSON.stringify(this.result, null, 2)], { type: 'application/json;charset=utf-8' });
+            let url = URL.createObjectURL(file);
+            let link = document.createElement('a');
+            link.href = url;
+            link.download = 'north-code-' + this.method + '.json';
+            link.click();
+            URL.revokeObjectURL(url);
+        },
+
+        downloadPurchases() {
+            let rows = [['Объект', 'Модель', 'Предложение', 'Поставщик', 'Количество', 'Цена', 'Готовность, дни']];
+            for (let item of this.result.plan) {
+                rows.push([
+                    item.object_id,
+                    item.equipment_id,
+                    item.offer_id,
+                    item.supplier_name,
+                    1,
+                    item.unit_price_rub,
+                    item.ready_days,
+                ]);
+            }
+            rows.push(['Оборудование', '', '', '', '', this.result.equipment_cost]);
+            rows.push(['Доставка', '', '', '', '', this.result.delivery_cost]);
+            rows.push(['Итого', '', '', '', '', this.result.cost]);
+            let csv =
+                '\ufeff' +
+                rows
+                    .map((row) => row.map((value) => '"' + String(value ?? '').replaceAll('"', '""') + '"').join(';'))
+                    .join('\r\n');
+            let url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
+            let link = document.createElement('a');
+            link.href = url;
+            link.download = 'north-code-purchases.csv';
+            link.click();
+            URL.revokeObjectURL(url);
+        },
+
+        async loadData(id) {
+            let res = await axios.get('/api/data', { params: id ? { dataset_id: id } : {} });
+            this.data = res.data;
+            this.budget = Number(res.data.station[0].recommended_budget_rub);
+            this.deadline = Number(res.data.station[0].deadline_days);
+            this.disabledSuppliers = [];
+            this.models = [];
+            this.searched = false;
+            this.selectedModel = '';
+            let types = [...new Set(res.data.equipment.map((item) => item.equipment_type))];
+            if (!types.includes(this.searchType)) this.searchType = types[0];
+            this.clearResults();
+        },
+
+        async latestData() {
+            this.busy = true;
+            this.error = '';
+            try {
+                await this.loadData();
+            } catch (error) {
+                this.showError(error);
+            } finally {
+                this.busy = false;
+            }
+        },
+
+        selectFile(name, event) {
+            this.importFiles[name] = event.target.files[0] || null;
+        },
+
+        async importCSV() {
+            if (this.busy) return;
+            if (Object.values(this.importFiles).some((file) => !file)) {
+                this.error = 'Выберите все четыре CSV-файла';
+                return;
+            }
+            if (Object.values(this.importFiles).reduce((size, file) => size + file.size, 0) > 9 * 1024 * 1024) {
+                this.error = 'Общий размер файлов должен быть не больше 9 МБ';
+                return;
+            }
+            let form = new FormData();
+            form.append('name', this.importName);
+            for (let [name, file] of Object.entries(this.importFiles)) form.append(name, file);
+            this.busy = true;
+            this.error = '';
+            this.notice = '';
+            try {
+                let res = await axios.post('/api/import', form);
+                await this.loadData(res.data.dataset.id);
+                this.notice =
+                    'Импорт завершён: ' +
+                    res.data.counts.equipment +
+                    ' моделей, ' +
+                    res.data.counts.offers +
+                    ' предложений, ' +
+                    res.data.counts.requirements +
+                    (this.isDemo ? ' потребностей. Это демо: данные сохранены в браузере.' : ' потребностей. Данные сохранены в PostgreSQL.');
+                this.tab = 'station';
+            } catch (error) {
+                this.showError(error);
+            } finally {
+                this.busy = false;
+            }
+        },
+
+        openTab(tab) {
+            this.tab = tab;
+            this.error = '';
+            if (tab === 'history') this.loadHistory();
+        },
+
+        resetDemo() {
+            try { localStorage.removeItem('north-code-demo-v1'); } catch {}
+            window.location.reload();
+        },
+    },
+    async mounted() {
+        try {
+            await this.loadData();
+            await this.calculate();
+        } catch (error) {
+            this.showError(error);
+        } finally {
+            this.loading = false;
+        }
+    },
+};
+</script>
+
+<template>
+    <div class="arctic-background" aria-hidden="true">
+        <img src="./assets/arctic-station.jpg" alt="" decoding="async" fetchpriority="high" />
+        <video
+            v-if="motionAllowed"
+            src="./assets/arctic-station.mp4"
+            :class="{ ready: videoReady }"
+            autoplay
+            muted
+            loop
+            playsinline
+            preload="auto"
+            tabindex="-1"
+            @playing="videoReady = true"
+            @error="videoReady = false"
+        ></video>
+    </div>
+    <div class="app-layout">
+        <aside class="sidebar">
+            <a class="brand" href="#" @click.prevent="openTab('station')" aria-label="Северный код — главная">
+                <span class="brand-mark">✳</span>
+                <span>
+                    СЕВЕРНЫЙ
+                    <br />
+                    КОД
+                    <span class="brand-dot">.</span>
+                </span>
+            </a>
+            <div class="workspace-label">ЦЕНТР ВОССТАНОВЛЕНИЯ</div>
+            <nav aria-label="Разделы">
+                <button
+                    v-for="item in nav"
+                    :key="item.id"
+                    :disabled="busy"
+                    :class="['nav-item', { active: tab === item.id }]"
+                    @click="openTab(item.id)"
+                >
+                    <span class="nav-icon">{{ item.icon }}</span>
+                    {{ item.name }}
+                    <span v-if="tab === item.id" class="nav-arrow">↗</span>
+                </button>
+            </nav>
+            <div class="sidebar-bottom">
+                <span class="status-dot"></span>
+                {{ data?.station?.[0]?.station_name || 'Станция' }}
+                <small>{{ data?.station?.[0]?.station_id || '—' }} · Арктическая экспедиция</small>
+                <div class="sidebar-line"></div>
+                <span class="small-muted">ПЛАНИРОВАНИЕ / V 1.0</span>
+            </div>
+        </aside>
+
+        <main class="main-content">
+            <header class="topbar">
+                <span>
+                    Операционный центр
+                    <span class="separator">/</span>
+                    {{ nav.find((item) => item.id === tab)?.name }}
+                </span>
+                <span class="station-code">
+                    ● {{ data?.station?.[0]?.station_id || '—' }}
+                    <span>ЭКСПЕДИЦИЯ</span>
+                </span>
+            </header>
+            <div class="page-content">
+                <div v-if="isDemo" class="demo-banner" role="status">
+                    <div><strong>Автономный просмотр</strong><span>Можно переключать экраны, менять бюджет, смотреть закупки и сохранять планы. Показаны готовые примеры, всё работает локально.</span></div>
+                    <button class="secondary-btn" @click="resetDemo">Сбросить демо ↻</button>
+                </div>
+
+                <div class="page-heading">
+                    <div>
+                        <div class="eyebrow">ЭКСПЕДИЦИЯ / ВОССТАНОВЛЕНИЕ ПОСЛЕ БУРИ</div>
+                        <h1>
+                            {{
+                                tab === 'station'
+                                    ? 'Вернуть станцию к жизни'
+                                    : nav.find((item) => item.id === tab)?.name
+                            }}
+                        </h1>
+                        <p>
+                            {{
+                                tab === 'station'
+                                    ? 'Один план. Все ресурсы. Каждое решение под контролем.'
+                                    : tab === 'comparison'
+                                      ? 'Сравниваем два точных метода на одинаковых данных.'
+                                      : tab === 'catalog'
+                                        ? 'Найдите оборудование по мощности и условиям эксплуатации.'
+                                        : tab === 'history'
+                                          ? 'Сохранённые сценарии и результаты расчётов.'
+                                          : 'Оборудование, поставщики и сроки в одном заказе.'
+                            }}
+                        </p>
+                    </div>
+                    <span class="outline-label">
+                        ПОЛЯРНАЯ ПРОГРАММА
+                        <span>↗</span>
+                    </span>
+                </div>
+
+                <div v-if="error" class="alert error" role="alert">{{ error }}</div>
+                <div v-if="notice" class="alert success" role="status">{{ notice }}</div>
+                <div v-if="loading && !data" class="empty-state">Загружаем данные станции…</div>
+
+                <div v-if="data" class="dataset-bar">
+                    <span>{{ isDemo ? 'Демо' : 'PostgreSQL' }} · Набор #{{ data.dataset.id }} · {{ data.dataset.name }}</span>
+                    <button class="text-btn" :disabled="busy" @click="latestData">Последний набор ↻</button>
+                </div>
+
+                <template v-if="data && (tab === 'station' || tab === 'purchases')">
+                    <section class="control-panel">
+                        <div class="method-header">
+                            <span class="section-label">СПОСОБ ПЛАНИРОВАНИЯ</span>
+                            <span class="small-muted">Одинаковые данные. Разные подходы.</span>
+                        </div>
+                        <div class="method-grid">
+                            <button
+                                :disabled="busy"
+                                :class="['method-card', { selected: method === 'exact' }]"
+                                @click="method = 'exact'"
+                            >
+                                <span class="method-symbol">∑</span>
+                                <span>
+                                    <strong>Основной Go</strong>
+                                    <small>Потоки · подтверждённый оптимум</small>
+                                </span>
+                                <span class="radio-dot"></span>
+                            </button>
+                            <button
+                                :disabled="busy"
+                                :class="['method-card', { selected: method === 'ortools' }]"
+                                @click="method = 'ortools'"
+                            >
+                                <span class="method-symbol">◈</span>
+                                <span>
+                                    <strong>
+                                        OR-Tools
+                                        <em>CP-SAT</em>
+                                    </strong>
+                                    <small>CP-SAT · доказанный оптимум</small>
+                                </span>
+                                <span class="radio-dot"></span>
+                            </button>
+                        </div>
+                        <fieldset :disabled="busy" class="scenario-fields">
+                            <label>
+                                Бюджет, ₽
+                                <input
+                                    type="number"
+                                    v-model.number="budget"
+                                    min="0"
+                                    max="100000000"
+                                    step="1000"
+                                    @input="clearResults"
+                                />
+                            </label>
+                            <label>
+                                Срок, дней
+                                <input
+                                    type="number"
+                                    v-model.number="deadline"
+                                    min="1"
+                                    max="365"
+                                    @input="clearResults"
+                                />
+                            </label>
+                            <div class="control-actions">
+                                <button class="primary-btn" :disabled="busy" @click="calculate(false)">
+                                    {{ busy ? 'Выполняем расчёт…' : 'Рассчитать план' }}
+                                    <span v-if="!busy">↗</span>
+                                </button>
+                                <button class="secondary-btn" :disabled="busy" @click="calculate(true)">
+                                    Сравнить методы
+                                </button>
+                            </div>
+                        </fieldset>
+                        <details class="supplier-settings">
+                            <summary>
+                                Доступность поставщиков
+                                <span>
+                                    {{
+                                        disabledSuppliers.length
+                                            ? 'отключено: ' + disabledSuppliers.length
+                                            : 'все доступны'
+                                    }}
+                                </span>
+                            </summary>
+                            <div class="supplier-checkboxes">
+                                <label v-for="supplier in data.suppliers" :key="supplier.supplier_id">
+                                    <input
+                                        type="checkbox"
+                                        :value="supplier.supplier_id"
+                                        v-model="disabledSuppliers"
+                                        :disabled="busy"
+                                        @change="clearResults"
+                                    />
+                                    Отключить {{ supplier.supplier_name }}
+                                </label>
+                            </div>
+                        </details>
+                    </section>
+
+                    <div v-if="method === 'ortools'" class="alert solver-note">
+                        ◈ OR-Tools CP-SAT доказывает минимальную стоимость. Go независимо проверяет каждую закупку по
+                        исходным данным.
+                    </div>
+
+                    <section v-if="results.exact && results.ortools" class="panel compare-panel">
+                        <div class="panel-heading">
+                            <h2>Два метода — один сценарий</h2>
+                            <span class="small-muted">Приоритеты ТЗ сохранены</span>
+                        </div>
+                        <div class="table-wrap">
+                            <table>
+                                <thead>
+                                    <tr>
+                                        <th>Метод</th>
+                                        <th>Статус</th>
+                                        <th>Мобильных пунктов</th>
+                                        <th>Стоимость</th>
+                                        <th>Превышение</th>
+                                        <th>Время</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <tr v-for="key in ['exact', 'ortools']" :key="key">
+                                        <td>{{ methodName(key) }}</td>
+                                        <td>
+                                            {{
+                                                results[key].status === 'ok'
+                                                    ? (isDemo ? 'Готовый пример' : 'План проверен')
+                                                    : results[key].status === 'infeasible'
+                                                      ? 'Невозможно'
+                                                      : 'Не найден'
+                                            }}
+                                        </td>
+                                        <td>{{ results[key].optional_count ?? '—' }}</td>
+                                        <td>{{ results[key].cost == null ? '—' : money(results[key].cost) }}</td>
+                                        <td>{{ results[key].overrun == null ? '—' : money(results[key].overrun) }}</td>
+                                        <td>{{ results[key].seconds }} с</td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </section>
+
+                    <div v-if="!result && !busy" class="empty-state">
+                        Выберите метод и рассчитайте план для текущего сценария.
+                    </div>
+                    <div v-if="busy" class="calculating" role="status">
+                        <span class="spinner"></span>
+                        Проверяем потребности, остатки и варианты закупки…
+                    </div>
+                    <section v-if="result && !ready" class="panel">
+                        <h2>{{ result.message }}</h2>
+                        <p>
+                            Потребности обязательных объектов, требующие закупки. При наличии подходящих предложений
+                            причиной может быть общий дефицит остатков.
+                        </p>
+                        <ul>
+                            <li v-for="item in result.uncovered" :key="item.object_id + item.equipment_type">
+                                {{ item.object_id }} · {{ item.equipment_type }} — {{ item.reason }}
+                            </li>
+                        </ul>
+                    </section>
+
+                    <template v-if="ready">
+                        <div class="result-line">
+                            <span class="result-status">
+                                <span class="status-dot"></span>
+                                {{
+                                    isDemo ? 'Пример рассчитанного плана' : method === 'exact'
+                                        ? 'Оптимальный план найден'
+                                        : 'OR-Tools подтвердил оптимальный план'
+                                }}
+                            </span>
+                            <span class="small-muted">{{ result.seconds }} с · все ограничения проверены</span>
+                        </div>
+                        <div class="stats-grid">
+                            <article class="stat-card">
+                                <span>Общая стоимость</span>
+                                <strong>{{ money(result.cost) }}</strong>
+                                <small :class="{ 'text-danger': result.overrun > 0 }">
+                                    {{ result.overrun ? 'Превышение: ' + money(result.overrun) : 'В пределах бюджета' }}
+                                </small>
+                            </article>
+                            <article class="stat-card">
+                                <span>Объекты восстановлены</span>
+                                <strong>
+                                    {{ result.objects.filter((item) => item.restored).length }}
+                                    <i>/ {{ result.objects.length }}</i>
+                                </strong>
+                                <small>Все обязательные + {{ result.optional_count }} мобильных</small>
+                            </article>
+                            <article class="stat-card">
+                                <span>Готовность станции</span>
+                                <strong>
+                                    {{ result.ready_days }}
+                                    <i>дней</i>
+                                </strong>
+                                <small :class="{ 'text-warning': result.ready_days === result.deadline }">
+                                    {{ result.deadline - result.ready_days }} дн. запаса до срока
+                                </small>
+                            </article>
+                            <article class="stat-card">
+                                <span>Остаток бюджета</span>
+                                <strong>{{ money(result.balance) }}</strong>
+                                <small>Бюджет {{ money(result.budget) }}</small>
+                            </article>
+                        </div>
+
+                        <template v-if="tab === 'station'">
+                            <div class="overview-grid">
+                                <section class="panel station-panel">
+                                    <div class="panel-heading">
+                                        <div>
+                                            <span class="section-label">ОБЪЕКТЫ ЭКСПЕДИЦИИ</span>
+                                            <h2>Состояние станции</h2>
+                                        </div>
+                                        <span class="schematic-label">СХЕМА / НЕ КАРТА</span>
+                                    </div>
+                                    <div class="object-grid">
+                                        <button
+                                            v-for="item in result.objects"
+                                            :key="item.object_id"
+                                            :class="[
+                                                'object-card',
+                                                { closed: !item.restored, focused: selectedObject === item.object_id },
+                                            ]"
+                                            @click="
+                                                selectedObject = selectedObject === item.object_id ? '' : item.object_id
+                                            "
+                                        >
+                                            <div class="object-top">
+                                                <span class="object-code">{{ item.object_id }}</span>
+                                                <span class="object-icon">{{ item.optional ? '⌂' : '▥' }}</span>
+                                            </div>
+                                            <strong>{{ item.name }}</strong>
+                                            <span class="object-tag">
+                                                {{ !item.optional ? 'Обязательный объект' : 'Мобильный пункт' }}
+                                            </span>
+                                            <span :class="['object-state', { closed: !item.restored }]">
+                                                ●
+                                                {{
+                                                    item.restored
+                                                        ? 'Готов · день ' + item.ready_days
+                                                        : 'Останется закрыт'
+                                                }}
+                                            </span>
+                                        </button>
+                                    </div>
+                                    <div class="legend">
+                                        <span>
+                                            <i class="legend-dot green"></i>
+                                            Восстановлен
+                                        </span>
+                                        <span>
+                                            <i class="legend-dot gray"></i>
+                                            Закрыт
+                                        </span>
+                                        <span>Нажмите на объект для диагностики ↗</span>
+                                    </div>
+                                </section>
+                                <section class="panel budget-panel">
+                                    <span class="section-label">РАСПРЕДЕЛЕНИЕ РЕСУРСОВ</span>
+                                    <h2>Каждый рубль учтён</h2>
+                                    <div class="budget-visual">
+                                        <div
+                                            class="budget-ring"
+                                            :style="{
+                                                background:
+                                                    'conic-gradient(#e1c19c 0 ' +
+                                                    (result.equipment_cost / Math.max(result.cost, result.budget)) *
+                                                        100 +
+                                                    '%, #7c9fb7 0 ' +
+                                                    (result.cost / Math.max(result.cost, result.budget)) * 100 +
+                                                    '%, #344a5d 0 100%)',
+                                            }"
+                                        >
+                                            <div>
+                                                <span>ПОТРАЧЕНО</span>
+                                                <strong>
+                                                    {{ Math.round((result.cost / Math.max(1, result.budget)) * 100) }}%
+                                                </strong>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div class="budget-row">
+                                        <span>
+                                            <i class="legend-dot lime"></i>
+                                            Оборудование
+                                        </span>
+                                        <strong>{{ money(result.equipment_cost) }}</strong>
+                                    </div>
+                                    <div class="budget-row">
+                                        <span>
+                                            <i class="legend-dot green"></i>
+                                            Доставка
+                                        </span>
+                                        <strong>{{ money(result.delivery_cost) }}</strong>
+                                    </div>
+                                    <div class="budget-row">
+                                        <span>
+                                            <i class="legend-dot gray"></i>
+                                            Остаток
+                                        </span>
+                                        <strong>{{ money(result.balance) }}</strong>
+                                    </div>
+                                    <p class="small-muted">
+                                        Доставка оплачивается один раз каждому выбранному поставщику.
+                                    </p>
+                                </section>
+                            </div>
+
+                            <section v-if="selectedObject" class="panel details-panel">
+                                <div class="panel-heading">
+                                    <h2>Диагностика · {{ selectedObject }}</h2>
+                                    <button class="text-btn" @click="selectedObject = ''">Закрыть ×</button>
+                                </div>
+                                <div class="table-wrap">
+                                    <table>
+                                        <thead>
+                                            <tr>
+                                                <th>Тип</th>
+                                                <th>Доступно / нужно</th>
+                                                <th>Состояние</th>
+                                                <th>Выбранная замена</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            <tr v-for="item in objectDetails" :key="item.key">
+                                                <td>{{ item.equipment_type }}</td>
+                                                <td>
+                                                    {{ item.available_capacity }} / {{ item.required_capacity }}
+                                                    {{ item.capacity_unit }}
+                                                </td>
+                                                <td>{{ item.reasons.join('; ') || 'Замена не нужна' }}</td>
+                                                <td>
+                                                    {{
+                                                        result.plan.find((p) => p.key === item.key)?.equipment_id ||
+                                                        (item.needs_replacement
+                                                            ? 'Не закупается'
+                                                            : 'Сохраняем установленное')
+                                                    }}
+                                                </td>
+                                            </tr>
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </section>
+
+                            <section class="panel">
+                                <div class="panel-heading">
+                                    <div>
+                                        <span class="section-label">СЦЕНАРНЫЙ АНАЛИЗ</span>
+                                        <h2>Сколько стоит открыть больше пунктов</h2>
+                                    </div>
+                                    <span class="small-muted">
+                                        {{
+                                            method === 'exact'
+                                                ? 'Минимальная стоимость для каждого количества'
+                                                : 'Минимальная стоимость OR-Tools'
+                                        }}
+                                    </span>
+                                </div>
+                                <div class="frontier">
+                                    <div
+                                        v-for="item in result.frontier"
+                                        :key="item.optional_count"
+                                        :class="[
+                                            'frontier-row',
+                                            { chosen: item.optional_count === result.optional_count },
+                                        ]"
+                                    >
+                                        <span>
+                                            {{ item.optional_count }} из
+                                            {{ result.objects.filter((row) => row.optional).length }} пунктов
+                                        </span>
+                                        <div class="bar-track">
+                                            <div
+                                                :style="{
+                                                    width:
+                                                        Math.max(
+                                                            2,
+                                                            (item.cost /
+                                                                Math.max(...result.frontier.map((row) => row.cost))) *
+                                                                100,
+                                                        ) + '%',
+                                                }"
+                                                :class="{ over: item.cost > result.budget }"
+                                            ></div>
+                                        </div>
+                                        <strong>{{ money(item.cost) }}</strong>
+                                        <small>
+                                            {{
+                                                item.cost > result.budget
+                                                    ? '+' + money(item.cost - result.budget) + ' к бюджету'
+                                                    : 'В бюджете'
+                                            }}
+                                        </small>
+                                    </div>
+                                </div>
+                            </section>
+                        </template>
+
+                        <template v-if="tab === 'purchases'">
+                            <section v-for="group in groups" :key="group.supplier_id" class="panel">
+                                <div class="panel-heading">
+                                    <div>
+                                        <span class="section-label">{{ group.supplier_id }} · ПОСТАВЩИК</span>
+                                        <h2>{{ group.supplier_name }}</h2>
+                                    </div>
+                                    <span class="supplier-badge">
+                                        Доставка {{ money(group.delivery_cost_rub) }} · {{ group.delivery_days }} дн.
+                                    </span>
+                                </div>
+                                <div class="table-wrap">
+                                    <table>
+                                        <thead>
+                                            <tr>
+                                                <th>Объект</th>
+                                                <th>Оборудование</th>
+                                                <th>Предложение</th>
+                                                <th>Кол-во</th>
+                                                <th>Цена</th>
+                                                <th>Готовность</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            <tr v-for="item in group.items" :key="item.key">
+                                                <td>
+                                                    <span class="object-code">{{ item.object_id }}</span>
+                                                </td>
+                                                <td>
+                                                    <strong>{{ item.equipment_id }}</strong>
+                                                    <small class="cell-detail">{{ item.model_name }}</small>
+                                                </td>
+                                                <td>{{ item.offer_id }}</td>
+                                                <td>1</td>
+                                                <td>{{ money(item.unit_price_rub) }}</td>
+                                                <td>
+                                                    <span
+                                                        :class="[
+                                                            'day-badge',
+                                                            { tight: item.ready_days === result.deadline },
+                                                        ]"
+                                                    >
+                                                        День {{ item.ready_days }}
+                                                    </span>
+                                                </td>
+                                            </tr>
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </section>
+                            <section class="panel">
+                                <div class="panel-heading">
+                                    <h2>Календарь восстановления</h2>
+                                    <span class="small-muted">
+                                        Доставка и установка разных устройств идут параллельно
+                                    </span>
+                                </div>
+                                <div class="timeline">
+                                    <div
+                                        v-for="item in result.objects.filter((row) => row.restored)"
+                                        :key="item.object_id"
+                                        class="timeline-row"
+                                    >
+                                        <span>{{ item.object_id }}</span>
+                                        <div class="bar-track">
+                                            <div
+                                                :style="{
+                                                    width: Math.max(1, (item.ready_days / result.deadline) * 100) + '%',
+                                                }"
+                                            ></div>
+                                        </div>
+                                        <strong>День {{ item.ready_days }}</strong>
+                                    </div>
+                                </div>
+                            </section>
+                        </template>
+
+                        <section class="save-panel">
+                            <div>
+                                <strong>План готов к работе</strong>
+                                <p>Сохраните сценарий или выгрузите результаты.</p>
+                            </div>
+                            <input
+                                v-model="planName"
+                                maxlength="100"
+                                placeholder="Название сценария"
+                                aria-label="Название сценария"
+                            />
+                            <button class="secondary-btn" :disabled="busy" @click="savePlan">Сохранить</button>
+                            <button class="secondary-btn" @click="downloadReport">JSON ↓</button>
+                            <button class="primary-btn" @click="downloadPurchases">Закупки CSV ↓</button>
+                        </section>
+                    </template>
+                </template>
+
+                <template v-if="data && tab === 'catalog'">
+                    <section class="panel">
+                        <form class="catalog-search" @submit.prevent="search">
+                            <label>
+                                Тип оборудования
+                                <select v-model="searchType">
+                                    <option v-for="type in types" :key="type">{{ type }}</option>
+                                </select>
+                            </label>
+                            <label>
+                                Минимальная производительность
+                                <input type="number" v-model.number="searchCapacity" min="0" required />
+                            </label>
+                            <label>
+                                Температура, °C
+                                <input type="number" v-model.number="searchTemperature" required />
+                            </label>
+                            <button class="primary-btn" type="submit">Найти модели ↗</button>
+                        </form>
+                        <p class="small-muted">
+                            Поиск по характеристикам не зависит от плана восстановления. Единица производительности
+                            определяется типом оборудования.
+                        </p>
+                    </section>
+                    <section v-if="searched" class="panel">
+                        <div class="panel-heading">
+                            <h2>Подходящие модели</h2>
+                            <span class="small-muted">Найдено: {{ models.length }}</span>
+                        </div>
+                        <div v-if="!models.length" class="empty-state">Нет моделей с такими характеристиками.</div>
+                        <div v-else class="table-wrap">
+                            <table>
+                                <thead>
+                                    <tr>
+                                        <th>Модель</th>
+                                        <th>Производительность</th>
+                                        <th>Мин. температура</th>
+                                        <th>Установка</th>
+                                        <th></th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <tr v-for="item in models" :key="item.equipment_id">
+                                        <td>
+                                            <strong>{{ item.equipment_id }}</strong>
+                                            <small class="cell-detail">{{ item.model_name }}</small>
+                                        </td>
+                                        <td>{{ item.capacity }} {{ item.capacity_unit }}</td>
+                                        <td>{{ item.min_operating_temperature_c }} °C</td>
+                                        <td>{{ item.installation_days }} дн.</td>
+                                        <td>
+                                            <button class="text-btn" @click="selectedModel = item.equipment_id">
+                                                Предложения ↗
+                                            </button>
+                                        </td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </section>
+                    <section v-if="selectedModel" class="panel">
+                        <div class="panel-heading">
+                            <h2>Предложения · {{ selectedModel }}</h2>
+                            <span class="small-muted">Проверка срока: {{ deadline }} дней</span>
+                        </div>
+                        <div class="table-wrap">
+                            <table>
+                                <thead>
+                                    <tr>
+                                        <th>Поставщик</th>
+                                        <th>Цена / шт.</th>
+                                        <th>Остаток</th>
+                                        <th>Цена 1 шт. с доставкой</th>
+                                        <th>Готовность</th>
+                                        <th>Проверка</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <tr v-for="item in selectedOffers" :key="item.offer_id">
+                                        <td>{{ offerInfo(item).supplier }}</td>
+                                        <td>{{ money(item.unit_price_rub) }}</td>
+                                        <td>{{ item.stock_quantity }}</td>
+                                        <td>
+                                            {{
+                                                money(
+                                                    Number(item.unit_price_rub) +
+                                                        Number(
+                                                            data.suppliers.find(
+                                                                (s) => s.supplier_id === item.supplier_id,
+                                                            ).delivery_cost_rub,
+                                                        ),
+                                                )
+                                            }}
+                                        </td>
+                                        <td>День {{ offerInfo(item).ready }}</td>
+                                        <td>{{ offerInfo(item).reason }}</td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </section>
+                </template>
+
+                <template v-if="data && tab === 'comparison'">
+                    <section class="panel">
+                        <div class="panel-heading">
+                            <h2>Два точных алгоритма</h2><p v-if="isDemo">В демо для обоих методов показан готовый пример. Настоящие решатели доступны в полной версии приложения.</p>
+                            <button class="primary-btn" :disabled="busy" @click="calculate(true)">
+                                {{ busy ? 'Считаем…' : 'Сравнить методы' }}
+                            </button>
+                        </div>
+                        <p>
+                            Набор #{{ data.dataset.id }} · бюджет {{ money(budget) }} · срок {{ deadline }} дней.
+                            Отключённые поставщики и все ограничения одинаковы для обоих методов.
+                        </p>
+                        <div class="explain-grid">
+                            <div>
+                                <span class="explain-number">01 / GO</span>
+                                <h3>Минимальный стоимостной поток</h3>
+                                <p>
+                                    Перебор наборов объектов и поставщиков с безопасными отсечениями. Общие остатки
+                                    ограничивают поток, доставка оплачивается один раз.
+                                </p>
+                            </div>
+                            <div>
+                                <span class="explain-number">02 / OR-TOOLS</span>
+                                <h3>CP-SAT</h3>
+                                <p>
+                                    Целочисленная модель с переменными закупок, поставщиков и восстановления объектов.
+                                    Для каждого количества пунктов решатель доказывает минимальную стоимость.
+                                </p>
+                            </div>
+                        </div>
+                        <p>
+                            Порядок приоритетов: все обязательные объекты → минимальное превышение → больше мобильных
+                            пунктов → минимальная стоимость. Цены, сроки, температура и остатки повторно проверяются Go
+                            по исходным данным PostgreSQL.
+                        </p>
+                    </section>
+                    <section v-if="results.exact && results.ortools" class="panel">
+                        <h2>Результаты на текущем сценарии</h2>
+                        <div class="table-wrap">
+                            <table>
+                                <thead>
+                                    <tr>
+                                        <th>Метод</th>
+                                        <th>Статус</th>
+                                        <th>Пунктов</th>
+                                        <th>Превышение</th>
+                                        <th>Стоимость</th>
+                                        <th>Время</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <tr v-for="key in ['exact', 'ortools']" :key="key">
+                                        <td>{{ methodName(key) }}</td>
+                                        <td>
+                                            {{
+                                                results[key].status === 'ok'
+                                                    ? (isDemo ? 'Готовый пример' : 'Оптимум подтверждён')
+                                                    : 'Восстановление невозможно'
+                                            }}
+                                        </td>
+                                        <td>{{ results[key].optional_count ?? '—' }}</td>
+                                        <td>{{ results[key].overrun == null ? '—' : money(results[key].overrun) }}</td>
+                                        <td>{{ results[key].cost == null ? '—' : money(results[key].cost) }}</td>
+                                        <td>{{ results[key].seconds }} с</td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </section>
+                </template>
+
+                <template v-if="tab === 'import'">
+                    <section class="panel">
+                        <h2>Загрузить комплект CSV</h2>
+                        <p>
+                            UTF-8, разделитель «;». Выберите все четыре файла. При ошибке текущий набор останется
+                            рабочим. История сохраняет связь с исходной версией данных.
+                        </p>
+                        <form class="import-form" @submit.prevent="importCSV">
+                            <label>
+                                Название набора
+                                <input
+                                    v-model="importName"
+                                    maxlength="100"
+                                    placeholder="Например, Станция после бури"
+                                    :disabled="busy"
+                                />
+                            </label>
+                            <div class="import-grid">
+                                <label
+                                    v-for="item in [
+                                        { key: 'equipment', name: 'Каталог оборудования' },
+                                        { key: 'suppliers', name: 'Поставщики' },
+                                        { key: 'offers', name: 'Предложения' },
+                                        { key: 'station', name: 'Отчёт станции' },
+                                    ]"
+                                    :key="item.key"
+                                >
+                                    {{ item.name }}
+                                    <input
+                                        type="file"
+                                        accept=".csv,text/csv"
+                                        :disabled="busy"
+                                        @change="selectFile(item.key, $event)"
+                                    />
+                                </label>
+                            </div>
+                            <button class="primary-btn" type="submit" :disabled="busy">
+                                {{ busy ? 'Проверяем и сохраняем…' : (isDemo ? 'Загрузить в демо' : 'Импортировать в PostgreSQL') }}
+                            </button>
+                        </form>
+                    </section>
+                    <section v-if="data" class="panel">
+                        <h2>Текущий набор #{{ data.dataset.id }}</h2>
+                        <p>{{ data.dataset.name }}</p>
+                        <div class="stats-grid">
+                            <article class="stat-card">
+                                <span>Моделей</span>
+                                <strong>{{ data.equipment.length }}</strong>
+                            </article>
+                            <article class="stat-card">
+                                <span>Поставщиков</span>
+                                <strong>{{ data.suppliers.length }}</strong>
+                            </article>
+                            <article class="stat-card">
+                                <span>Предложений</span>
+                                <strong>{{ data.offers.length }}</strong>
+                            </article>
+                            <article class="stat-card">
+                                <span>Потребностей</span>
+                                <strong>{{ data.station.length }}</strong>
+                            </article>
+                        </div>
+                    </section>
+                </template>
+
+                <template v-if="tab === 'history'">
+                    <section class="panel">
+                        <div class="panel-heading">
+                            <h2>Сохранённые планы</h2>
+                            <button class="text-btn" @click="loadHistory">Обновить ↻</button>
+                        </div>
+                        <div v-if="!history.length" class="empty-state">Здесь появятся сохранённые расчёты.</div>
+                        <div v-else class="table-wrap">
+                            <table>
+                                <thead>
+                                    <tr>
+                                        <th>Название · редактируется</th>
+                                        <th>Метод</th>
+                                        <th>Стоимость</th>
+                                        <th>Создано, UTC</th>
+                                        <th></th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <tr v-for="item in history" :key="item.id">
+                                        <td>
+                                            <input
+                                                v-model="item.name"
+                                                maxlength="100"
+                                                @change="renamePlan(item)"
+                                                aria-label="Название сохранённого плана"
+                                            />
+                                        </td>
+                                        <td>{{ methodName(item.result.method) }}</td>
+                                        <td>{{ item.result.cost == null ? '—' : money(item.result.cost) }}</td>
+                                        <td>{{ item.created_at }}</td>
+                                        <td class="row-actions">
+                                            <button class="text-btn" @click="openPlan(item)">Открыть ↗</button>
+                                            <button class="text-btn text-danger" @click="deletePlan(item)">
+                                                Удалить
+                                            </button>
+                                        </td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </section>
+                </template>
+                <footer class="page-footer">
+                    <span>
+                        СЕВЕРНЫЙ КОД
+                        <span class="brand-dot">✳</span>
+                    </span>
+                    <span>Решения, которые можно проверить.</span>
+                </footer>
+            </div>
+        </main>
+    </div>
+</template>
