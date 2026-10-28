@@ -9,7 +9,7 @@
 Нужны Git, Docker и Docker Compose v2. Из терминала:
 
 ```bash
-git clone https://github.com/foryoucode/hihihaton.git
+git clone https://github.com/Willyamdevon/politex26.git
 cd hihihaton
 docker compose up --build -d --wait --remove-orphans
 ```
